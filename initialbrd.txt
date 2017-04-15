@@ -1,0 +1,5 @@
+Size: 5,5
+White: {d4,c3}
+Black: {d3,c4}
+Color: Black
+Timeout: 99999
