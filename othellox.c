@@ -5,48 +5,49 @@
 #include <string.h>
 #include <math.h>
 #include <mpi.h>
+#include <float.h>
 
-int slaves;
-int myid;
 
+//Representation of pieces
 #define EMPTY 0
 #define BLACK 1
 #define WHITE 2
-#define FLIP(x) (3-(x))  
-#define SMALLEST_FLOAT -1.0e10
-#define LARGEST_FLOAT 1.0e10
+
+//parallelism
 #define MASTER_ID slaves
-#define JOB_TAG 1001
+#define COMPUTATION_TAG 9999
 
+int slaves;//num of slaves
+int myid;//id of process
+long long comm_time = 0;
+long long comp_time = 0;
 
-typedef enum { false, true } bool;
+int boardVisited = 0;
+int deepestDepthVisited = 0;
+int searchedEntire = 1;
+double timeTaken = 0.0;
 
-// To specify the 8 different directions in (x, y) for finding legal moves and flipping pieces on board
-const int DIRECTION[8][2] = { { 1, 0 },{ 1, 1 },{ 0, 1 },{ -1, 1 },{ -1, 0 },{ -1, -1 },{ 0, -1 },{ 1, -1 } };
+// initialbrd
+int boardSize;
+int xSize, ySize;
+int color;
+char initialWhite[676][4];
+char initialBlack[676][4];
+int initialBlackCount, initialWhiteCount;
+int timeOut;
 
-//for output data analysis
-int numOfBoardsAccessed = 0;
-int depthOfBoards = 0;
-bool isEntireSpace = true;
-double elapsedTimeInSec = 0.0;
+// evalparams 
+int maxDepth;
+int maxBoards;
+int cornerValue;
+int edgeValue;
+long long startTime;
 
-// initialbrd variables
-int sizeOfArray;
-int size_x, size_y;
-char white_positions[350][5];
-char black_positions[350][5];
-int black_size, white_size;
+//int DIRECTION[8][2] = { UP,UP_RIGHT,UP_LEFT,RIGHT,LEFT,DOWN,DOWN_RIGHT,DOWN_LEFT };
+int DIRECTION[8][2] = { { 0,1 } ,{ 1,1 },{ -1,1 },{ 1,0 },{ -1,0 },{ 0,-1 },{ 1,-1 },{ -1,-1 } };
 
-// evalparams variables
-int maxDepth, maxBoards, cornerValue, edgeValue, bestMovesForColor, timeOut;
-
-//declaration of function due to being mutually recursive
-float getMax(char *board, int turnColor, int numOfPlayerPieces, int numOfOppPieces, int depth, float alpha, float beta, bool isPassPrev);
-float getMin(char *board, int turnColor, int numOfPlayerPieces, int numOfOppPieces, int depth, float alpha, float beta, bool isPassPrev);
-
-/*
-Determines the current time
-*/
+/*START OF UTILITIES FUNCTION*/
+//get current time
 long long wall_clock_time() {
 #ifdef LINUX
 	struct timespec tp;
@@ -58,21 +59,16 @@ long long wall_clock_time() {
 	return (long long)(tv.tv_usec * 1000 + (long long)tv.tv_sec * 1000000000ll);
 #endif
 }
-
+//trim white spaces given a string, from stackoverflow
 char *trimWhiteSpace(char *str) {
 	char *end;
-
-	if (str == NULL) {
+	if (str == NULL)
 		return str;
-	}
-
 	// Trim leading space
-	while (isspace((unsigned char)*str)) {
+	while (isspace((unsigned char)*str))
 		str++;
-	}
-	if (*str == 0) {
+	if (*str == 0)
 		return str;
-	}
 	// Trim trailing space
 	end = str + strlen(str) - 1;
 	while (end > str && isspace((unsigned char)*end)) {
@@ -82,855 +78,691 @@ char *trimWhiteSpace(char *str) {
 
 	return str;
 }
+//print visualized board
+void printBoard(char *board) {
 
-int translateInputPosToIndex(char *pos) {
-	int letter = pos[0] - 96;
-	int num, result;
-	if (strlen(pos) == 2) {
-		num = pos[1] - '0';
+	printf("\n");
+	printf("    ");
+	int i,j;
+	for (i = 0; i<xSize; i++) {
+		printf("%c ", 'a' + i);
+	}
+	//i is y axis
+	for (i = 0; i < ySize; i++) {
+		printf("\n %02d ", i + 1);
+		//j is x axis
+		for (j = 0; j < xSize; j++) {
+			if (board[j*xSize + i] == WHITE)
+				printf("w ");
+			else if (board[j*xSize + i] == BLACK)
+				printf("b ");
+			else
+				printf(". ");
+		}
+	}
+
+}
+//print results
+void printResult(int *bestMoves, int bestMovesCount, double timeTaken) {
+	printf("\nBest moves: { ");
+	if (bestMovesCount == 0) {
+		printf("na }\n");
 	}
 	else {
-		num = (pos[1] - '0') * 10 + (pos[2] - '0');
+		int i;
+		for (i = 0; i < bestMovesCount; i++) {
+			if (i == bestMovesCount - 1) {
+				printf("%s }\n", boardToString(bestMoves[i]));
+			}
+			else {
+				printf("%s,", boardToString(bestMoves[i]));
+			}
+		}
 	}
 
-	result = (num - 1) + (letter - 1) * size_x;
-	return result;
+	printf("Number of boards assessed: %d\n", boardVisited);
+	printf("Depth of boards: %d\n", deepestDepthVisited);
+	if (searchedEntire) {
+		printf("Entire space: true\n");
+	}
+	else {
+		printf("Entire space: false\n");
+	}
+	printf("Elapsed time in seconds: %f\n", timeTaken);
 }
+//read argument files
+void readFile(char *initialbrd, char *evalparams) {
+	char line[300];
+	char *left, *right;
+	FILE *fileInitial = fopen(initialbrd, "r");
+	FILE *fileEval = fopen(evalparams, "r");
 
-char *translateIndexToOutputPos(int index) {
-	int num = index + 1;
-	int letter = 1;
-	while (num > size_x) {
-		num = num - size_x;
-		letter++;
+	// read initialbrd
+	while (fgets(line, sizeof(line), fileInitial)) {
+		left = strtok(line, ":");
+		if (left != NULL)
+			right = trimWhiteSpace(strtok(NULL, ":"));
+		if (strcmp(left, "Size") == 0) {
+			xSize = atoi(strtok(right, ","));
+			ySize = atoi(strtok(NULL, ","));
+			boardSize = xSize * ySize;
+		}
+		else if (strcmp(left, "Color") == 0) {
+			if (strcmp(right, "Black") == 0)
+				color = BLACK;
+			else
+				color = WHITE;
+		}
+		else if (strcmp(left, "Timeout") == 0)
+			timeOut = atoi(right);
+		else {
+			int countInitial = 0;
+			right = strtok(trimWhiteSpace(strtok(right, "{}")), ",");
+			while (right != NULL) {
+				if (strcmp(left, "White") == 0)
+					strcpy(initialWhite[countInitial], right);
+				else if (strcmp(left, "Black") == 0)
+					strcpy(initialBlack[countInitial], right);
+				right = strtok(NULL, ",");
+				countInitial++;
+			}
+			if (strcmp(left, "White") == 0)
+				initialWhiteCount = countInitial;
+			else
+				initialBlackCount = countInitial;
+		}
 	}
-	char outputLetter = letter + 96;
 
-	char strNum[10];
-	sprintf(strNum, "%d", num);
+	//evalparams.txt
+	while (fgets(line, sizeof(line), fileEval)) {
+		left = strtok(line, ":");
+		if (left != NULL)
+			right = trimWhiteSpace(strtok(NULL, ":"));
+		if (strcmp(left, "MaxDepth") == 0)
+			maxDepth = atoi(right);
+		else if (strcmp(left, "MaxBoards") == 0)
+			maxBoards = atoi(right);
+		else if (strcmp(left, "CornerValue") == 0)
+			cornerValue = atoi(right);
+
+		else if (strcmp(left, "EdgeValue") == 0)
+			edgeValue = atoi(right);
+	}
+	fclose(fileInitial);
+	fclose(fileEval);
+}
+//convert alphabet and number string to board index
+int stringToBoard(char *pos) {
+	//convert a,b,c to 1,2,3
+	int alphabet = pos[0] - 96;
+	int num;
+	//convert 1,2,3 in char to int
+	if (strlen(pos) == 2)
+		num = pos[1] - 48;
+	else
+		num = (pos[1] - 48) * 10 + (pos[2] - 48);
+	//board position =  letter part*xSize + num part 
+	return (alphabet - 1) * xSize + (num - 1);
+}
+//convert index to string containing the alphabet and number
+char *boardToString(int i) {
+
+	int num = (i + 1) % xSize;
+	if (num == 0) num = xSize;
+
+	int alphabet = ((i + 1) - num) / xSize;
+	char alphabetChar = alphabet + 97;
+
+	char stringNum[10];
+	sprintf(stringNum, "%d", num);
 
 	char string[5];
-	string[0] = outputLetter;
-	string[1] = strNum[0];
-	if (num >= 10) {
-		string[2] = strNum[1];
+	string[0] = alphabetChar;
+	string[1] = stringNum[0];
+	if (num > 9) {
+		string[2] = stringNum[1];
 		string[3] = '\0';
 	}
-	else {
+	else
 		string[2] = '\0';
-	}
 
 	char *result = malloc(5);
 	strcpy(result, string);
 	return result;
 }
+/*END OF UTILITIES FUNCTION*/
 
-void printBoard(char *board) {
-	// A-Z on the y-axis(top to bottom), 1-26 on the x-axis(left to right)
-	int a;
-	for (a = 0; a < sizeOfArray; a++) {
-		printf("%d", board[a]);
-		if ((a + 1) % size_x == 0) {
-			printf("\n");
-		}
-	}
-}
+/*START OF SLAVE AND MASTER*/
+void master(char *initialbrd, char *evalparams) {
+	char board[676];
+	int bestMoves[676];
+	int bestMovesCount = 0;
 
-void readFiles(char *initialbrd, char *evalparams) {
-	char line[256];
-	char *label, *details;
-	FILE *file1 = fopen(initialbrd, "r");
-	FILE *file2 = fopen(evalparams, "r");
-
-	// initialbrd.txt
-	while (fgets(line, sizeof(line), file1)) {
-		label = strtok(line, ":");
-		if (label != NULL) {
-			details = trimWhiteSpace(strtok(NULL, ":"));
-		}
-		if (strcmp(label, "Size") == 0) {
-			char *x_temp = strtok(details, ",");
-			char *y_temp = strtok(NULL, ",");
-			size_x = atoi(x_temp);
-			size_y = atoi(y_temp);
-			sizeOfArray = size_x * size_y;
-		}
-		else if (strcmp(label, "Color") == 0) {
-			if (strcmp(details, "Black") == 0) {
-				bestMovesForColor = 1;
-			}
-			else {
-				bestMovesForColor = 2;
-			}
-		}
-		else if (strcmp(label, "Timeout") == 0) {
-			timeOut = atoi(details);
-		}
-		else {
-			int count = 0;
-			char *pos = trimWhiteSpace(strtok(details, "{}"));
-			char *posInv = strtok(pos, ",");
-			while (posInv != NULL) {
-				if (strcmp(label, "White") == 0) {
-					strcpy(white_positions[count], posInv);
-				}
-				else if (strcmp(label, "Black") == 0) {
-					strcpy(black_positions[count], posInv);
-				}
-				posInv = strtok(NULL, ",");
-				count++;
-			}
-			if (strcmp(label, "White") == 0) {
-				white_size = count;
-			}
-			else if (strcmp(label, "Black") == 0) {
-				black_size = count;
-			}
-		}
-	}
-
-	//evalparams.txt
-	while (fgets(line, sizeof(line), file2)) {
-		label = strtok(line, ":");
-		if (label != NULL) {
-			details = trimWhiteSpace(strtok(NULL, ":"));
-		}
-		if (strcmp(label, "MaxDepth") == 0) {
-			maxDepth = atoi(details);
-		}
-		else if (strcmp(label, "MaxBoards") == 0) {
-			maxBoards = atoi(details);
-		}
-		else if (strcmp(label, "CornerValue") == 0) {
-			cornerValue = atoi(details);
-		}
-		else if (strcmp(label, "EdgeValue") == 0) {
-			edgeValue = atoi(details);
-		}
-		else {
-			//nothing
-		}
-	}
-
-	fclose(file1);
-	fclose(file2);
-
-	//broadcast readFiles data from master to all slaves
+	//read file
+	readFile(initialbrd, evalparams);
+	//Share information with slaves
+	//initialbrd
+	MPI_Bcast(&xSize, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&ySize, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&boardSize, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&initialBlackCount, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&initialWhiteCount, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&color, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&timeOut, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
 	int i;
-	MPI_Bcast(&size_x, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&size_y, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&sizeOfArray, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&black_size, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&white_size, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	for (i = 0; i < white_size; i++) {
-		MPI_Bcast(&white_positions[i], 5, MPI_CHAR, MASTER_ID, MPI_COMM_WORLD);
-	}
-	for (i = 0; i < black_size; i++) {
-		MPI_Bcast(&black_positions[i], 5, MPI_CHAR, MASTER_ID, MPI_COMM_WORLD);
-	}
+	for (i = 0; i < initialWhiteCount; i++)
+		MPI_Bcast(&initialWhite[i], 5, MPI_CHAR, MASTER_ID, MPI_COMM_WORLD);
+
+	for (i = 0; i < initialBlackCount; i++)
+		MPI_Bcast(&initialBlack[i], 5, MPI_CHAR, MASTER_ID, MPI_COMM_WORLD);
+	//evalparams
 	MPI_Bcast(&maxDepth, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
 	MPI_Bcast(&maxBoards, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
 	MPI_Bcast(&cornerValue, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
 	MPI_Bcast(&edgeValue, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&bestMovesForColor, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&timeOut, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-}
 
+	//start of mini max algorithm
+	clock_t begin = clock();
+	initBoard(board);
+	printBoard(board);
+	getMinimaxMoves(board, bestMoves, &bestMovesCount);
+	clock_t end = clock();
+	timeTaken = (double)(end - begin) / CLOCKS_PER_SEC;
+
+	int slave_id;
+	//send terminating request to all slaves
+	int request = 0;
+	for (slave_id = 0; slave_id < slaves; slave_id++)
+		MPI_Send(&request, 1, MPI_INT, slave_id, COMPUTATION_TAG, MPI_COMM_WORLD);
+
+	printResult(bestMoves, bestMovesCount, timeTaken);
+}
+void slave() {
+	MPI_Status status;
+	int requestNo;
+	int boardSizeInfo;
+	int playerInfo;
+	int indexInfo;
+	int arrayInfo[800];
+	char boardInfo[676];
+	int results[800];
+	int result;
+	long long before, after;
+	int i;
+	//get information from master
+	//initialbrd
+	MPI_Bcast(&xSize, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&ySize, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&boardSize, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&initialBlackCount, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&initialWhiteCount, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&color, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&timeOut, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	for (i = 0; i < initialWhiteCount; i++) {
+		MPI_Bcast(&initialWhite[i], 5, MPI_CHAR, MASTER_ID, MPI_COMM_WORLD);
+	}
+	for (i = 0; i < initialBlackCount; i++) {
+		MPI_Bcast(&initialBlack[i], 5, MPI_CHAR, MASTER_ID, MPI_COMM_WORLD);
+	}
+	//evalparams
+	MPI_Bcast(&maxDepth, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&maxBoards, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&cornerValue, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+	MPI_Bcast(&edgeValue, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
+
+	while (1) {
+		before = wall_clock_time();
+		//get request
+		MPI_Info(&requestNo, 1, MPI_INT, MPI_ANY_SOURCE, COMPUTATION_TAG, MPI_COMM_WORLD, &status);
+		if (requestNo == 1) { //request to find whether a move is valid
+			MPI_Info(&boardInfo, boardSize, MPI_CHAR, MASTER_ID, myid, MPI_COMM_WORLD, &status);
+			MPI_Info(&playerInfo, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
+			if (boardSize > slaves) {//more than 1 moves to check for
+				MPI_Info(&boardSizeInfo, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
+				MPI_Info(&arrayInfo, boardSizeInfo, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
+				after = wall_clock_time();
+				comm_time += after - before;
+				//check if moves is valid
+				before = wall_clock_time();
+				for (i = 0; i < boardSizeInfo; i++) {
+					if (legalP(boardInfo, arrayInfo[i], playerInfo))
+						results[i] = 1;
+					else
+						results[i] = 0;
+				}
+				after = wall_clock_time();
+				comp_time += after - before;
+				//send result back to master
+				before = wall_clock_time();
+				MPI_Send(results, boardSizeInfo, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD);
+				after = wall_clock_time();
+				comm_time += after - before;
+			}
+			else {//only a single move to check for
+				MPI_Info(&indexInfo, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
+				after = wall_clock_time();
+				comm_time += after - before;
+				//check if a move is valid
+				before = wall_clock_time();
+				if (legalP(boardInfo, indexInfo, playerInfo))
+					result = 1;
+				else
+					result = 0;
+				after = wall_clock_time();
+				comp_time += after - before;
+				//send result back to master
+				before = wall_clock_time();
+				MPI_Send(&result, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD);
+				after = wall_clock_time();
+				comm_time += after - before;
+			}
+		}
+		else if (requestNo == 0)//terminating request
+			break;
+	}
+	printf(" --- SLAVE %d: communication_time=%6.2f seconds; computation_time=%6.2f seconds\n", myid, comm_time / 1000000000.0, comp_time / 1000000000.0);
+}
+/*END OF SLAVE MASTER*/
+
+/*START OF BOARD FUNCTION*/
+//Create the initial board
 void initBoard(char *board) {
 	int i;
-	for (i = 0; i < sizeOfArray; i++) {
+	for (i = 0; i < boardSize; i++)
 		board[i] = EMPTY;
-	}
-	for (i = 0; i < white_size; i++) {
-		board[translateInputPosToIndex(white_positions[i])] = WHITE;
-	}
-	for (i = 0; i < black_size; i++) {
-		board[translateInputPosToIndex(black_positions[i])] = BLACK;
-	}
+	for (i = 0; i < initialWhiteCount; i++)
+		board[stringToBoard(initialWhite[i])] = WHITE;
+
+	for (i = 0; i < initialBlackCount; i++)
+		board[stringToBoard(initialBlack[i])] = BLACK;
+
 }
-
-bool isLegalMove(char *board, int index, int legalMoveFor) { //legal move for which player color white/black
-	int x = index + 1;
-	int y = 1;
-	while (x > size_x) {
-		x = x - size_x;
-		y++;
-	}
-
-	if (board[index] != EMPTY) {
-		return false;
-	}
-	int dir;
-	for (dir = 0; dir < 8; dir++) { // checking for legal moves in all 8 directions, horizontal, vertial and diagonal
-		int dx = DIRECTION[dir][0];
-		int dy = DIRECTION[dir][1];
-		int tempx = x;
-		int tempy = y;
-		int numFlipped = 0;
-
-		bool cont = true;
-		while (cont) {
-			tempx = tempx + dx;
-			tempy = tempy + dy;
-
-			if (tempx <= 0 || tempx > size_x || tempy <= 0 || tempy > size_y) {
-				cont = false;
-				continue;
-			}
-
-			int tempIndex = (tempx - 1) + (tempy - 1) * size_x;
-			if (board[tempIndex] == EMPTY) {
-				cont = false;
-			}
-			else if (board[tempIndex] == WHITE) {
-				if (legalMoveFor == BLACK) {
-					numFlipped++;
-				}
-				else {
-					if (numFlipped == 0) {
-						cont = false;
-					}
-					else {
-						return true;
-					}
-				}
-			}
-			else {
-				if (legalMoveFor == WHITE) {
-					numFlipped++;
-				}
-				else {
-					if (numFlipped == 0) {
-						cont = false;
-					}
-					else {
-						return true;
-					}
-				}
-			}
-		}
-	}
-	return false;
-}
-
-bool findAllLegalMovesSequential(char *board, int legalMoveFor, int *lm, int *counter) {
-	bool result = false;
-	int count = 0;
+//duplicate a board
+void duplicateBoard(char *from, char *to) {
 	int i;
-	for (i = 0; i < sizeOfArray; i++) {
-		if (isLegalMove(board, i, legalMoveFor)) {
-			result = true;
-			lm[count] = i;
-			count++;
+	for (i = 0; i < boardSize; i++)
+		to[i] = from[i];
+}
+//get opponent
+int opponent(int color) {
+	if (color == BLACK)
+		return WHITE;
+	else if (color == WHITE)
+		return BLACK;
+	return 0;
+}
+//convert alphabet and number to the board index
+int convertBoardIndex(int alphabet, int num) {
+	return (alphabet - 1) * xSize + (num - 1);
+}
+//check whether a move is legal
+int legalP(char *board, int i, int player) {
+
+	int num = (i + 1) % xSize;
+	if (num == 0) num = xSize;
+
+	int alphabet = ((i + 1) - num) / xSize + 1;
+	//printf("%d,%d\n", num, alphabet);
+	int j;
+	if (board[i] == EMPTY) {
+		j = 0;
+		while (j <= 7 && wouldFlip(alphabet, num, board, player, DIRECTION[j]) == -1) {
+			j++;
+		}
+		if (j == 8)
+			return 0;
+		else {
+			return 1;
 		}
 	}
-	*counter = count;
-	return result;
+	return 0;
+}
+//check if within board range
+int validP(int num, int alphabet) {
+	if (num<1 || num > ySize)
+		return -1;
+	if (alphabet < 1 || alphabet > xSize)
+		return -1;
+	return 1;
+}
+//check if a move will make any flips in a direction
+int wouldFlip(int alphabet, int num, char *board, int player, int move[2]) {
+	int y = num + move[1];
+	int x = alphabet + move[0];
+
+	if (!validP(x, y))
+		return -1;
+	if (board[convertBoardIndex(x, y)] == opponent(player)) {
+		x += move[0];
+		y += move[1];
+		if (!validP(x, y))
+			return -1;
+		return findBracketingPiece(x, y, player, board, move);
+	}
+	else return -1;
+}
+//find a bracketing piece that surround opponent piece
+int findBracketingPiece(int x, int y, int player, char *board, int move[2]) {
+	int opp = opponent(player);
+	while (board[convertBoardIndex(x, y)] == opp) {
+		x += move[0];
+		y += move[1];
+		if (!validP(x, y))
+			return -1;
+	};
+
+	if (board[convertBoardIndex(x, y)] == player)
+		return convertBoardIndex(x, y);
+	else {
+		return -1;
+	}
 }
 
-bool findAllLegalMoves(char *board, int legalMoveFor, int *lm, int *counter) {
-	int jobNo = 1;
-	bool result = false;
-	int count = 0;
-	int i, slave_id;
-	int indexCounter = 0;
-	bool resultsRecv[1000];
-	bool resultRecv;
-	MPI_Status status;
+//flip opponent piece caught in between
+int makeFlips(int alphabet, int num, int player, char *board, int move[2]) {
+	int countFlipped = 0;
+	int bracketer = wouldFlip(alphabet, num, board, player, move);
+	//if there is a bracket piece
+	if (bracketer != -1) {
+		alphabet += move[0];
+		num += move[1];
+		while (1) {
+			//flip
+			board[convertBoardIndex(alphabet, num)] = player;
+			countFlipped++;
+			alphabet += move[0];
+			num += move[1];
+			//terminate
+			if (convertBoardIndex(alphabet, num) == bracketer)
+				return countFlipped;
+		}
+	}
+}
+//make a actual move on the board
+int makeMove(char *board, int move, int player) {
+	int countFlips = 0;
+	int i;
+	board[move] = player;
 
-	if (sizeOfArray > slaves) {
-		//split work to slaves
+	int num = (move + 1) % xSize;
+	if (num == 0) move = xSize;
+
+	int alphabet = ((move + 1) - num) / xSize + 1;
+
+	//for all directions, check flipping
+	for (i = 0; i <= 7; i++)
+		countFlips += makeFlips(alphabet, num, player, board, DIRECTION[i]);
+
+	return countFlips;
+}
+//check if any legal move for a given player
+int anyLegalMove(int player, char * board) {
+	int i;
+	for (i = 0; i < boardSize; i++) {
+		if (legalP(board, i, player) == 1)
+			return 1;
+	}
+	return 0;
+}
+//check who is the next player
+int nextPlayer(char *board, int previousplayer) {
+	int opp = opponent(previousplayer);
+	if (anyLegalMove(opp, board) == 1)
+		return opp;
+	else if (anyLegalMove(previousplayer, board) == 1) {
+		return previousplayer;
+	}
+	else {
+		return 0;
+	}
+}
+//find all legal moves by distributing work to slaves
+void findAllLegalMove(char *board, int player, int *moves, int *moveCounts) {
+	MPI_Status status;
+	int resultsInfo[800];
+	int requestNo = 1;
+	int result = 0;
+	int count = 0;
+	int slave_id;
+	
+	int i;
+	if (boardSize > slaves) {
+		//distribute workload evenly when there is more workload than number of slaves
 		for (slave_id = 0; slave_id < slaves; slave_id++) {
-			int startIndex = (int)(sizeOfArray * slave_id / slaves);
-			int size = (int)(sizeOfArray * (slave_id + 1) / slaves) - startIndex;
+			int start = (int)(boardSize * slave_id / slaves);
+			int size = (int)(boardSize * (slave_id + 1) / slaves) - start;
 			int arraySend[size];
 			for (i = 0; i < size; i++) {
-				arraySend[i] = startIndex + i;
+				arraySend[i] = start + i;
 			}
-			MPI_Send(&jobNo, 1, MPI_INT, slave_id, JOB_TAG, MPI_COMM_WORLD);
-			MPI_Send(&board[0], sizeOfArray, MPI_CHAR, slave_id, slave_id, MPI_COMM_WORLD);
-			MPI_Send(&legalMoveFor, 1, MPI_INT, slave_id, slave_id, MPI_COMM_WORLD);
+			MPI_Send(&requestNo, 1, MPI_INT, slave_id, COMPUTATION_TAG, MPI_COMM_WORLD);
+			MPI_Send(&board[0], boardSize, MPI_CHAR, slave_id, slave_id, MPI_COMM_WORLD);
+			MPI_Send(&player, 1, MPI_INT, slave_id, slave_id, MPI_COMM_WORLD);
 			MPI_Send(&size, 1, MPI_INT, slave_id, slave_id, MPI_COMM_WORLD);
 			MPI_Send(arraySend, size, MPI_INT, slave_id, slave_id, MPI_COMM_WORLD);
 		}
-		//receive results from slaves
+		//receive results back from slaves
+		int index = 0;
 		for (slave_id = 0; slave_id < slaves; slave_id++) {
-			int startIndex = (int)(sizeOfArray * slave_id / slaves);
-			int size = (int)(sizeOfArray * (slave_id + 1) / slaves) - startIndex;
-			MPI_Recv(&resultsRecv, size, MPI_INT, slave_id, slave_id, MPI_COMM_WORLD, &status);
+			int start = (int)(boardSize * slave_id / slaves);
+			int size = (int)(boardSize * (slave_id + 1) / slaves) - start;
+			MPI_Info(&resultsInfo, size, MPI_INT, slave_id, slave_id, MPI_COMM_WORLD, &status);
 			for (i = 0; i < size; i++) {
-				if (resultsRecv[i]) {
-					result = true;
-					lm[count] = indexCounter;
+				if (resultsInfo[i]) {
+					result = 1;
+					moves[count] = index;
 					count++;
 				}
-				indexCounter++;
+				index++;
 			}
 		}
 	}
-	else {
-		//split work to slaves
-		for (i = 0; i < sizeOfArray; i++) {
-			MPI_Send(&jobNo, 1, MPI_INT, i, JOB_TAG, MPI_COMM_WORLD);
-			MPI_Send(&board[0], sizeOfArray, MPI_CHAR, i, i, MPI_COMM_WORLD);
-			MPI_Send(&legalMoveFor, 1, MPI_INT, i, i, MPI_COMM_WORLD);
+	else {//more slaves than workload, can just distribute 1 to each
+		for (i = 0; i < boardSize; i++) {
+			MPI_Send(&requestNo, 1, MPI_INT, i, COMPUTATION_TAG, MPI_COMM_WORLD);
+			MPI_Send(&board[0], boardSize, MPI_CHAR, i, i, MPI_COMM_WORLD);
+			MPI_Send(&player, 1, MPI_INT, i, i, MPI_COMM_WORLD);
 			MPI_Send(&i, 1, MPI_INT, i, i, MPI_COMM_WORLD);
 		}
-		//receive results from slaves
-		for (i = 0; i < sizeOfArray; i++) {
-			MPI_Recv(&resultRecv, 1, MPI_INT, i, i, MPI_COMM_WORLD, &status);
-			if (resultRecv) {
-				result = true;
-				lm[count] = i;
+		//receive results back from slaves
+		int resultInfo;
+		for (i = 0; i < boardSize; i++) {
+			MPI_Info(&resultInfo, 1, MPI_INT, i, i, MPI_COMM_WORLD, &status);
+			if (resultInfo) {
+				result = 1;
+				moves[count] = i;
 				count++;
 			}
 		}
 	}
-	*counter = count;
-	return result;
+	*moveCounts = count;
+	return;
 }
-// not used in the running of the program
-void countPieces(char *board, int *numBlack, int *numWhite) {
-	int black = 0;
-	int white = 0;
+//calculate differences between pieces
+int diffEval(int player, char * board) {
+	int oppCount = 0, playerCount = 0;
+	int opp = opponent(player);
 	int i;
-	for (i = 0; i < sizeOfArray; i++) {
-		if (board[i] == BLACK) {
-			black++;
-		}
-		else if (board[i] == WHITE) {
-			white++;
-		}
+	for (i = 0; i < boardSize; i++) {
+		if (board[i] == player)
+			playerCount++;
+		else if (board[i] == opp)
+			oppCount++;
 	}
-	*numBlack = black;
-	*numWhite = white;
+	return playerCount - oppCount;
 }
+//heuristic evaluation of board
+double heuristicEval(int player, char* board) {
+	int opp = opponent(player);
+	//heuristic 1: differences between pieces
+	double pieceHeuristic = 250 * diffEval(player, board);
 
-void copyBoardArray(char *from, char *to) {
-	int i;
-	for (i = 0; i < sizeOfArray; i++) {
-		to[i] = from[i];
-	}
+	//heuristic 2: occupancy of corner
+	double cornerHeuristic = 0;
+	if (board[0] == player)
+		cornerHeuristic++;
+	else if (board[0] == opp)
+		cornerHeuristic--;
+	if (board[xSize - 1] == player)
+		cornerHeuristic++;
+	else if (board[xSize - 1] == opp)
+		cornerHeuristic--;
+	if (board[xSize*ySize - 1] == player)
+		cornerHeuristic++;
+	else if (board[xSize*ySize - 1] == opp)
+		cornerHeuristic--;
+	if (board[xSize*(ySize - 1)] == player)
+		cornerHeuristic++;
+	else if (board[xSize*(ySize - 1)] == opp)
+		cornerHeuristic--;
+	cornerHeuristic *= 801.724;
+
+	//heuristic 3: mobility of player
+	int legalMoves[676];
+	int countLegalMoves = 0;
+	findAllLegalMove(board, player, legalMoves, &countLegalMoves);
+	double mobilityHeuristic = countLegalMoves * 39.46;
+	return mobilityHeuristic + cornerHeuristic + pieceHeuristic;
 }
+/*START OF MINI MAX ALGORITHM*/
+double getMinMax(int player, char *board, int depth, int minOrMax, double alpha, double beta) {
 
-int flipPiecesOnBoard(char *board, int legalMove, int legalMoveFor) {
-	board[legalMove] = legalMoveFor;
-
-	int x = legalMove + 1;
-	int y = 1;
-	while (x > size_x) {
-		x = x - size_x;
-		y++;
+	if (depth > maxDepth || boardVisited >= maxBoards) {
+		searchedEntire = 0;
+		return heuristicEval(player, board);
 	}
+	if (depth > deepestDepthVisited)
+		deepestDepthVisited = depth;
+	boardVisited++;
+	int next;
+	double score;
+	double bestScore;
+	int opp = opponent(player);
 
-	int totalFlips = 0;
-	int dir;
-	for (dir = 0; dir < 8; dir++) { // checking for legal moves in all 8 directions, horizontal, vertial and diagonal
-		int dx = DIRECTION[dir][0];
-		int dy = DIRECTION[dir][1];
-		int tempx = x;
-		int tempy = y;
-		int numFlipped = 0;
+	//get all moves
+	int legalMoves[676];
+	double scoreLegalMove[676];
+	int countLegalMoves = 0;
+	findAllLegalMove(board, color, legalMoves, &countLegalMoves);
+	char newBoard[676];
 
-		bool cont = true;
-		while (cont) {
-			tempx = tempx + dx;
-			tempy = tempy + dy;
-
-			if (tempx <= 0 || tempx > size_x || tempy <= 0 || tempy > size_y) {
-				cont = false;
-				continue;
-			}
-
-			int tempIndex = (tempx - 1) + (tempy - 1) * size_x;
-			if (board[tempIndex] == EMPTY) {
-				cont = false;
-			}
-			else if (board[tempIndex] == WHITE) {
-				if (legalMoveFor == BLACK) {
-					numFlipped++;
-				}
-				else {
-					if (numFlipped == 0) {
-						cont = false;
-					}
-					else {
-						totalFlips += numFlipped;
-						int flipIndex;
-						while (numFlipped > 0) {
-							tempx = tempx - dx;
-							tempy = tempy - dy;
-							flipIndex = (tempx - 1) + (tempy - 1) * size_x;
-							board[flipIndex] = FLIP(board[flipIndex]);
-							numFlipped--;
-						}
-					}
-				}
-			}
-			else {
-				if (legalMoveFor == WHITE) {
-					numFlipped++;
-				}
-				else {
-					if (numFlipped == 0) {
-						cont = false;
-					}
-					else {
-						totalFlips += numFlipped;
-						int flipIndex;
-						while (numFlipped > 0) {
-							tempx = tempx - dx;
-							tempy = tempy - dy;
-							flipIndex = (tempx - 1) + (tempy - 1) * size_x;
-							board[flipIndex] = FLIP(board[flipIndex]);
-							numFlipped--;
-						}
-					}
-				}
-			}
-		}
+	//min, opponent
+	if (minOrMax == 0) {
+		bestScore = DBL_MAX;
+		findAllLegalMove(board, opp, legalMoves, &countLegalMoves);
 	}
-	return totalFlips;
-}
-
-float evaluateBoard(char *board, int turnColor, int numOfPlayerPieces, int numOfOppPieces) {
-	//difference in pieces between player making the move and opponent
-	//1st evaluation function
-	float diffInPiecesValue = (float)100 * (numOfPlayerPieces - numOfOppPieces) / (numOfPlayerPieces + numOfOppPieces);
-
-	//relative difference in number of legal moves for both players
-	//2nd evaluation function
-	int legalMovesForMax[350];
-	int numOfLegalMovesForMax = 0;
-	findAllLegalMoves(board, bestMovesForColor, legalMovesForMax, &numOfLegalMovesForMax);
-
-	int legalMovesForMin[350];
-	int numOfLegalMovesForMin = 0;
-	findAllLegalMoves(board, FLIP(bestMovesForColor), legalMovesForMin, &numOfLegalMovesForMin);
-
-	float diffInMovesValue;
-	if (numOfLegalMovesForMax + numOfLegalMovesForMin != 0) {
-		diffInMovesValue = (float)100 * (numOfLegalMovesForMax - numOfLegalMovesForMin) / (numOfLegalMovesForMax + numOfLegalMovesForMin);
+	else { //max, player
+		bestScore = DBL_MIN;
+		findAllLegalMove(board, color, legalMoves, &countLegalMoves);
 	}
-	else {
-		diffInMovesValue = 0.0;
-	}
-
-	//corners captured
-	//3rd evaluation function
-	float cornerHeuristicValue = 0.0;
-	float cornerValueForMax = 0.0, cornerValueForMin = 0.0;
-	int corners[4];
-
-	if (size_x > 1 && size_y > 1) {
-		corners[0] = 0;
-		corners[1] = size_x - 1;
-		corners[2] = (size_y - 1) * size_x;
-		corners[3] = size_x * size_y - 1;
-		int j;
-		for (j = 0; j < 4; j++) {
-			if (board[corners[j]] == BLACK) {
-				if (bestMovesForColor == BLACK) {
-					cornerValueForMax += 1.0;
-				}
-				else {
-					cornerValueForMin += 1.0;
-				}
-			}
-			else if (board[corners[j]] == WHITE) {
-				if (bestMovesForColor == WHITE) {
-					cornerValueForMax += 1.0;
-				}
-				else {
-					cornerValueForMin += 1.0;
-				}
-			}
-		}
-		if (cornerValueForMax + cornerValueForMin != 0.0) {
-			cornerHeuristicValue = (float)100 * (cornerValueForMax - cornerValueForMin) / (cornerValueForMax + cornerValueForMin);
-		}
-	}
-
-	//edges captured
-	//4th evaluation function
-	float edgesHeuristicValue = 0.0;
-	float edgesValueForMax = 0.0, edgesValueForMin = 0.0;
-	int edges[100];
-	int edgesCount = 0;
-
-	if (size_x > 1 && size_y > 1) {
-		int i;
-		for (i = corners[0] + 1; i < corners[1]; i++) {
-			edges[edgesCount] = i;
-			edgesCount++;
-		}
-		for (i = corners[1] + size_x; i < corners[3]; i += size_x) {
-			edges[edgesCount] = i;
-			edgesCount++;
-		}
-		for (i = corners[0] + size_x; i < corners[2]; i += size_x) {
-			edges[edgesCount] = i;
-			edgesCount++;
-		}
-		for (i = corners[2] + 1; i < corners[3]; i++) {
-			edges[edgesCount] = i;
-			edgesCount++;
-		}
-
-		for (i = 0; i < edgesCount; i++) {
-			if (board[edges[i]] == BLACK) {
-				if (bestMovesForColor == BLACK) {
-					edgesValueForMax += 1.0;
-				}
-				else {
-					edgesValueForMin += 1.0;
-				}
-			}
-			else if (board[edges[i]] == WHITE) {
-				if (bestMovesForColor == WHITE) {
-					edgesValueForMax += 1.0;
-				}
-				else {
-					edgesValueForMin += 1.0;
-				}
-			}
-		}
-		if (edgesValueForMax + edgesValueForMin != 0.0) {
-			edgesHeuristicValue = (float)100 * (edgesValueForMax - edgesValueForMin) / (edgesValueForMax + edgesValueForMin);
-		}
-	}
-
-	//final weighted score
-	float w1 = 1.0, w2 = 5.0, w3 = (float)cornerValue, w4 = (float)edgeValue;
-	float score = w1 * diffInPiecesValue + w2 * diffInMovesValue + w3 * cornerHeuristicValue + w4 * edgesHeuristicValue;
-
-	return score;
-}
-
-float getMax(char *board, int turnColor, int numOfPlayerPieces, int numOfOppPieces, int depth, float alpha, float beta, bool isPassedPrev) {
-	numOfBoardsAccessed++;
-	if (depth > depthOfBoards) {
-		depthOfBoards = depth;
-	}
-
-	if (numOfPlayerPieces == 0) { // lose!
-		return SMALLEST_FLOAT;
-	}
-	else if (numOfOppPieces == 0) {
-		return LARGEST_FLOAT;
-	}
-
-	if ((numOfPlayerPieces + numOfOppPieces) == sizeOfArray) { //end game
-		return evaluateBoard(board, turnColor, numOfPlayerPieces, numOfOppPieces);
-	}
-	if (depth == maxDepth) {
-		return evaluateBoard(board, turnColor, numOfPlayerPieces, numOfOppPieces);
-	}
-	if (numOfBoardsAccessed >= maxBoards) {
-		return evaluateBoard(board, turnColor, numOfPlayerPieces, numOfOppPieces);
-	}
-
-	float maxValue = SMALLEST_FLOAT;
-	float curValue = 0.0;
-	int numOfFlipped;
-	char mmBoard[676];
-
-	int legalMoves[350];
-	int numOfLegalMoves = 0;
-	findAllLegalMoves(board, turnColor, legalMoves, &numOfLegalMoves);
-
-	//No legal moves, have to pass
-	if (numOfLegalMoves == 0) {
-		if (isPassedPrev) {
-			return evaluateBoard(board, turnColor, numOfPlayerPieces, numOfOppPieces);
-		}
-		curValue = getMin(mmBoard, FLIP(turnColor), numOfPlayerPieces, numOfOppPieces, depth + 1, alpha, beta, true);
-		if (curValue > maxValue) {
-			maxValue = curValue;
-		}
-		return maxValue;
+	if (countLegalMoves == 0) {//searched entire space
+		return heuristicEval(player, board);
 	}
 	int i;
-	for (i = 0; i < numOfLegalMoves; i++) {
-		if (numOfBoardsAccessed >= maxBoards) {
-			isEntireSpace = false;
-			break;
+	for (i = 0; i < countLegalMoves; i++) {
+		duplicateBoard(board, newBoard);
+		if (minOrMax == 0) {
+			makeMove(board, legalMoves[i], opp);
+			next = nextPlayer(newBoard, opp);
 		}
-		copyBoardArray(board, mmBoard);
-		numOfFlipped = flipPiecesOnBoard(mmBoard, legalMoves[i], turnColor);
-
-		curValue = getMin(mmBoard, FLIP(turnColor), numOfPlayerPieces + numOfFlipped + 1,
-			numOfOppPieces - numOfFlipped, depth + 1, alpha, beta, false);
-		if (curValue > maxValue) {
-			maxValue = curValue;
+		else {//MAX
+			makeMove(board, legalMoves[i], player);
+			next = nextPlayer(newBoard, player);
 		}
-		if (maxValue >= beta) {
-			return maxValue;
+		//no player can move, gameover
+		if (next == 0) {
+			score = heuristicEval(player, board);
 		}
-		if (maxValue > alpha) {
-			alpha = maxValue;
+		else if (next == player) {
+			score = getMinMax(player, newBoard, depth + 1, 1, alpha, beta);
+		}
+		else if (next == opp) {
+			score = getMinMax(player, newBoard, depth + 1, 0, alpha, beta);
+		}
+		//update
+		if (minOrMax == 1) {//MAX
+			if (score > bestScore)
+				bestScore = score;
+			if (score >= beta) {//pruning
+				return bestScore;
+			}
+			if (score > alpha)
+				alpha = score;
+		}
+		else if (minOrMax == 0) {//MIN
+			if (score < bestScore)
+				bestScore = score;
+			if (score <= alpha) { //pruning
+				return bestScore;
+			}
+			if (score < beta)
+				beta = score;
 		}
 	}
-	return maxValue;
+	return bestScore;
 }
+//compute set of best moves
+void getMinimaxMoves(char *board, int *bestMoves, int *moveCount) {
+	int next;
+	double score;
+	double bestScore = DBL_MIN;
+	int opp = opponent(color);
+	double alpha = DBL_MIN;
+	double beta = DBL_MAX;
 
-float getMin(char *board, int turnColor, int numOfPlayerPieces, int numOfOppPieces, int depth, float alpha, float beta, bool isPassedPrev) {
-	numOfBoardsAccessed++;
-	if (depth > depthOfBoards) {
-		depthOfBoards = depth;
-	}
-
-	if (numOfPlayerPieces == 0) { // lose!
-		return SMALLEST_FLOAT;
-	}
-	else if (numOfOppPieces == 0) {
-		return LARGEST_FLOAT;
-	}
-
-	if ((numOfPlayerPieces + numOfOppPieces) == sizeOfArray) { //end game
-		return evaluateBoard(board, turnColor, numOfPlayerPieces, numOfOppPieces);
-	}
-	if (depth == maxDepth) {
-		return evaluateBoard(board, turnColor, numOfPlayerPieces, numOfOppPieces);
-	}
-	if (numOfBoardsAccessed >= maxBoards) {
-		return evaluateBoard(board, turnColor, numOfPlayerPieces, numOfOppPieces);
-	}
-
-	float minValue = LARGEST_FLOAT;
-	float curValue = 0.0;
-	int numOfFlipped;
-	char mmBoard[676];
-
-	int legalMoves[350];
-	int numOfLegalMoves = 0;
-	findAllLegalMoves(board, turnColor, legalMoves, &numOfLegalMoves);
-
-	//No legal moves, have to pass
-	if (numOfLegalMoves == 0) {
-		if (isPassedPrev) {
-			return evaluateBoard(board, turnColor, numOfPlayerPieces, numOfOppPieces);
-		}
-		curValue = getMax(mmBoard, FLIP(turnColor), numOfPlayerPieces, numOfOppPieces, depth + 1, alpha, beta, true);
-		if (curValue < minValue) {
-			minValue = curValue;
-		}
-		return minValue;
-	}
+	searchedEntire = 1; boardVisited = 1; deepestDepthVisited = 0; startTime = wall_clock_time();
+	//get all moves
+	int legalMoves[676];
+	double scoreLegalMove[676];
+	int countLegalMoves = 0;
+	findAllLegalMove(board, color, legalMoves, &countLegalMoves);
+	char newBoard[676];
 	int i;
-	for (i = 0; i < numOfLegalMoves; i++) {
-		if (numOfBoardsAccessed >= maxBoards) {
-			isEntireSpace = false;
-			break;
-		}
-		copyBoardArray(board, mmBoard);
-		numOfFlipped = flipPiecesOnBoard(mmBoard, legalMoves[i], turnColor);
+	for (i = 0; i < countLegalMoves; i++) {
+		duplicateBoard(board, newBoard);
+		makeMove(board, legalMoves[i], color);
 
-		curValue = getMax(mmBoard, FLIP(turnColor), numOfPlayerPieces - numOfFlipped,
-			numOfOppPieces + numOfFlipped + 1, depth + 1, alpha, beta, false);
-		if (curValue < minValue) {
-			minValue = curValue;
+		next = nextPlayer(newBoard, color);
+
+		//no player can move, gameover
+		if (next == 0) {
+			score = diffEval(color, newBoard);
+			if (score > 0) score = DBL_MAX;
+			if (score < 0) score = DBL_MIN;
 		}
-		if (minValue <= alpha) {
-			return minValue;
+		else if (next == color)
+			score = getMinMax(color, newBoard, 1, 1, alpha, beta);
+		else if (next == opp)
+			score = getMinMax(color, newBoard, 1, 0, alpha, beta);
+		if (score > bestScore) {
+			bestScore = score;
+
+			if (score > alpha)
+				alpha = score;
 		}
-		if (minValue < beta) {
-			beta = minValue;
+		scoreLegalMove[i] = score;
+	}
+	int bestMoveCount = 0;
+	int k;
+	for (k = 0; k < countLegalMoves; k++) {
+		if (scoreLegalMove[k] == bestScore) {
+			bestMoves[bestMoveCount] = legalMoves[k];
+			bestMoveCount++;
 		}
 	}
-	return minValue;
+	*moveCount = bestMoveCount;
 }
+/*END OF MINIMAX ALGORITHM*/
 
-void getMinimaxMoves(char *board, int *bestMoves, int *bmSize) {
-	int depth = 0;
-	int numOfBoards = 0;
-	float alpha = SMALLEST_FLOAT;
-	float beta = LARGEST_FLOAT;
-	int numOfFlipped;
-	int numOfPlayerPieces, numOfOppPieces;
-	int turnColor = bestMovesForColor;
 
-	float highestValue = SMALLEST_FLOAT;
-	int bestMovesCount = 0;
-
-	char mmBoard[676];
-
-	int legalMoves[350];
-	float valuesOfLegalMoves[350];
-	int numOfLegalMoves = 0;
-	findAllLegalMoves(board, turnColor, legalMoves, &numOfLegalMoves);
-
-	if (turnColor == BLACK) {
-		numOfPlayerPieces = black_size;
-		numOfOppPieces = white_size;
-	}
-	else {
-		numOfPlayerPieces = white_size;
-		numOfOppPieces = black_size;
-	}
-	int i;
-	for (i = 0; i < numOfLegalMoves; i++) {
-		if (numOfBoardsAccessed >= maxBoards) {
-			break;
-		}
-		copyBoardArray(board, mmBoard);
-		numOfFlipped = flipPiecesOnBoard(mmBoard, legalMoves[i], turnColor);
-
-		valuesOfLegalMoves[i] = getMin(mmBoard, FLIP(turnColor), numOfPlayerPieces + numOfFlipped + 1,
-			numOfOppPieces - numOfFlipped, depth + 1, alpha, beta, false);
-
-		if (valuesOfLegalMoves[i] > highestValue) {
-			highestValue = valuesOfLegalMoves[i];
-		}
-
-		printf("%d -> %f \n", legalMoves[i], valuesOfLegalMoves[i]);
-	}
-
-	for (i = 0; i < numOfLegalMoves; i++) {
-		if (valuesOfLegalMoves[i] == highestValue) {
-			bestMoves[bestMovesCount] = legalMoves[i];
-			bestMovesCount++;
-		}
-	}
-	*bmSize = bestMovesCount;
-}
-
-void slave() {
-	int i;
-	// receive broadcast readFiles data from master to slaves
-	MPI_Bcast(&size_x, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&size_y, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&sizeOfArray, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&black_size, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&white_size, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	for (i = 0; i < white_size; i++) {
-		MPI_Bcast(&white_positions[i], 5, MPI_CHAR, MASTER_ID, MPI_COMM_WORLD);
-	}
-	for (i = 0; i < black_size; i++) {
-		MPI_Bcast(&black_positions[i], 5, MPI_CHAR, MASTER_ID, MPI_COMM_WORLD);
-	}
-	MPI_Bcast(&maxDepth, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&maxBoards, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&cornerValue, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&edgeValue, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&bestMovesForColor, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-	MPI_Bcast(&timeOut, 1, MPI_INT, MASTER_ID, MPI_COMM_WORLD);
-
-	int jobNo;
-	int sizeOfArrayRecv;
-	int arrayRecv[1000];
-	char boardRecv[676];
-	int legalMoveForRecv;
-	int indexRecv;
-	bool results[1000];
-	bool result;
-	MPI_Status status;
-
-	while (true) {
-		MPI_Recv(&jobNo, 1, MPI_INT, MPI_ANY_SOURCE, JOB_TAG, MPI_COMM_WORLD, &status);
-		if (jobNo == 1) { // findAllLegalMoves
-			MPI_Recv(&boardRecv, sizeOfArray, MPI_CHAR, MASTER_ID, myid, MPI_COMM_WORLD, &status);
-			MPI_Recv(&legalMoveForRecv, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
-			if (sizeOfArray > slaves) {
-				MPI_Recv(&sizeOfArrayRecv, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
-				MPI_Recv(&arrayRecv, sizeOfArrayRecv, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
-				for (i = 0; i < sizeOfArrayRecv; i++) {
-					if (isLegalMove(boardRecv, arrayRecv[i], legalMoveForRecv)) {
-						results[i] = true;
-					}
-					else {
-						results[i] = false;
-					}
-				}
-				MPI_Send(results, sizeOfArrayRecv, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD);
-			}
-			else {
-				MPI_Recv(&indexRecv, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
-				if (isLegalMove(boardRecv, indexRecv, legalMoveForRecv)) {
-					result = true;
-					MPI_Send(&result, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD);
-				}
-				else {
-					result = false;
-					MPI_Send(&result, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD);
-				}
-			}
-		}
-		else { //jobNo == 0, means slaves are no longer needed and no jobs left
-			break;
-		}
-	}
-}
-
-void master(char *initialbrd, char *evalparams) {
-	char board[676]; // initial board specified by initialbrd.txt
-	int bestMoves[350];
-	int numOfBestMoves = 0;
-
-	//get the time taken to run the program
-	clock_t begin = clock();
-	readFiles(initialbrd, evalparams);
-	initBoard(board);
-	getMinimaxMoves(board, bestMoves, &numOfBestMoves);
-	clock_t end = clock();
-	elapsedTimeInSec = (double)(end - begin) / CLOCKS_PER_SEC;
-
-	// break while loop in slaves when there is no more jobs left
-	int slave_id;
-	int jobType = 0;
-	for (slave_id = 0; slave_id < slaves; slave_id++) {
-		MPI_Send(&jobType, 1, MPI_INT, slave_id, JOB_TAG, MPI_COMM_WORLD);
-	}
-
-	// print details for analysis after a run
-	printf("Best moves: {");
-	if (numOfBestMoves == 0) {
-		printf("na}\n");
-	}
-	else {
-		int i;
-		for (i = 0; i < numOfBestMoves; i++) {
-			if (i == numOfBestMoves - 1) {
-				printf("%s}\n", translateIndexToOutputPos(bestMoves[i]));
-			}
-			else {
-				printf("%s,", translateIndexToOutputPos(bestMoves[i]));
-			}
-		}
-	}
-
-	printf("Number of boards assessed: %d\n", numOfBoardsAccessed);
-	printf("Depth of boards: %d\n", depthOfBoards);
-	if (isEntireSpace) {
-		printf("Entire space: true");
-	}
-	else {
-		printf("Entire space: false");
-	}
-	printf("\n");
-	printf("Elapsed time in seconds: %f\n", elapsedTimeInSec);
-}
-
-/*
-Using master-slave paradigm
-Master process has id = 0
-Total number of processes is 1 + number of slaves
-*/
 int main(int argc, char **argv) {
+	
 	int nprocs;
 	MPI_Init(&argc, &argv);
 	MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
 	MPI_Comm_rank(MPI_COMM_WORLD, &myid);
 
 	slaves = nprocs - 1;
-
-	if (argc != 3) {
-		if (myid == MASTER_ID) {
-			fprintf(stderr, "Error, invalid number of arguments!");
-			MPI_Finalize();
-			exit(1);
-		}
-	}
 
 	if (myid == MASTER_ID) {
 		master(argv[1], argv[2]);
