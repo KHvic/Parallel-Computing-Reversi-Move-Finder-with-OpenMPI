@@ -41,7 +41,7 @@ int maxDepth;
 int maxBoards;
 int cornerValue;
 int edgeValue;
-long long startTime;
+clock_t start, current;
 
 //int DIRECTION[8][2] = { UP,UP_RIGHT,UP_LEFT,RIGHT,LEFT,DOWN,DOWN_RIGHT,DOWN_LEFT };
 int DIRECTION[8][2] = { { 0,1 } ,{ 1,1 },{ -1,1 },{ 1,0 },{ -1,0 },{ 0,-1 },{ 1,-1 },{ -1,-1 } };
@@ -83,7 +83,7 @@ void printBoard(char *board) {
 
 	printf("\n");
 	printf("    ");
-	int i,j;
+	int i, j;
 	for (i = 0; i<xSize; i++) {
 		printf("%c ", 'a' + i);
 	}
@@ -101,34 +101,6 @@ void printBoard(char *board) {
 		}
 	}
 
-}
-//print results
-void printResult(int *bestMoves, int bestMovesCount, double timeTaken) {
-	printf("\nBest moves: { ");
-	if (bestMovesCount == 0) {
-		printf("na }\n");
-	}
-	else {
-		int i;
-		for (i = 0; i < bestMovesCount; i++) {
-			if (i == bestMovesCount - 1) {
-				printf("%s }\n", boardToString(bestMoves[i]));
-			}
-			else {
-				printf("%s,", boardToString(bestMoves[i]));
-			}
-		}
-	}
-
-	printf("Number of boards assessed: %d\n", boardVisited);
-	printf("Depth of boards: %d\n", deepestDepthVisited);
-	if (searchedEntire) {
-		printf("Entire space: true\n");
-	}
-	else {
-		printf("Entire space: false\n");
-	}
-	printf("Elapsed time in seconds: %f\n", timeTaken);
 }
 //read argument files
 void readFile(char *initialbrd, char *evalparams) {
@@ -230,6 +202,34 @@ char *boardToString(int i) {
 	strcpy(result, string);
 	return result;
 }
+//print results
+void printResult(int *bestMoves, int bestMovesCount, double timeTaken) {
+	printf("\nBest moves: { ");
+	if (bestMovesCount == 0) {
+		printf("na }\n");
+	}
+	else {
+		int i;
+		for (i = 0; i < bestMovesCount; i++) {
+			if (i == bestMovesCount - 1) {
+				printf("%s }\n", boardToString(bestMoves[i]));
+			}
+			else {
+				printf("%s,", boardToString(bestMoves[i]));
+			}
+		}
+	}
+
+	printf("Number of boards assessed: %d\n", boardVisited);
+	printf("Depth of boards: %d\n", deepestDepthVisited);
+	if (searchedEntire) {
+		printf("Entire space: true\n");
+	}
+	else {
+		printf("Entire space: false\n");
+	}
+	printf("Elapsed time in seconds: %f\n", timeTaken);
+}
 /*END OF UTILITIES FUNCTION*/
 
 /*START OF SLAVE AND MASTER*/
@@ -313,13 +313,13 @@ void slave() {
 	while (1) {
 		before = wall_clock_time();
 		//get request
-		MPI_Info(&requestNo, 1, MPI_INT, MPI_ANY_SOURCE, COMPUTATION_TAG, MPI_COMM_WORLD, &status);
+		MPI_Recv(&requestNo, 1, MPI_INT, MPI_ANY_SOURCE, COMPUTATION_TAG, MPI_COMM_WORLD, &status);
 		if (requestNo == 1) { //request to find whether a move is valid
-			MPI_Info(&boardInfo, boardSize, MPI_CHAR, MASTER_ID, myid, MPI_COMM_WORLD, &status);
-			MPI_Info(&playerInfo, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
+			MPI_Recv(&boardInfo, boardSize, MPI_CHAR, MASTER_ID, myid, MPI_COMM_WORLD, &status);
+			MPI_Recv(&playerInfo, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
 			if (boardSize > slaves) {//more than 1 moves to check for
-				MPI_Info(&boardSizeInfo, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
-				MPI_Info(&arrayInfo, boardSizeInfo, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
+				MPI_Recv(&boardSizeInfo, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
+				MPI_Recv(&arrayInfo, boardSizeInfo, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
 				after = wall_clock_time();
 				comm_time += after - before;
 				//check if moves is valid
@@ -339,7 +339,7 @@ void slave() {
 				comm_time += after - before;
 			}
 			else {//only a single move to check for
-				MPI_Info(&indexInfo, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
+				MPI_Recv(&indexInfo, 1, MPI_INT, MASTER_ID, myid, MPI_COMM_WORLD, &status);
 				after = wall_clock_time();
 				comm_time += after - before;
 				//check if a move is valid
@@ -360,7 +360,7 @@ void slave() {
 		else if (requestNo == 0)//terminating request
 			break;
 	}
-	printf(" --- SLAVE %d: communication_time=%6.2f seconds; computation_time=%6.2f seconds\n", myid, comm_time / 1000000000.0, comp_time / 1000000000.0);
+	//printf(" --- SLAVE %d: communication_time=%6.2f seconds; computation_time=%6.2f seconds\n", myid, comm_time / 1000000000.0, comp_time / 1000000000.0);
 }
 /*END OF SLAVE MASTER*/
 
@@ -524,12 +524,14 @@ void findAllLegalMove(char *board, int player, int *moves, int *moveCounts) {
 	int result = 0;
 	int count = 0;
 	int slave_id;
-	
+
 	int i;
 	if (boardSize > slaves) {
 		//distribute workload evenly when there is more workload than number of slaves
 		for (slave_id = 0; slave_id < slaves; slave_id++) {
+			// Start(j) = Start point for process i =floor(N j / P)
 			int start = (int)(boardSize * slave_id / slaves);
+			// Length(j) = Length of work for i = floor(N (j + 1) / P) – start(j)
 			int size = (int)(boardSize * (slave_id + 1) / slaves) - start;
 			int arraySend[size];
 			for (i = 0; i < size; i++) {
@@ -546,7 +548,7 @@ void findAllLegalMove(char *board, int player, int *moves, int *moveCounts) {
 		for (slave_id = 0; slave_id < slaves; slave_id++) {
 			int start = (int)(boardSize * slave_id / slaves);
 			int size = (int)(boardSize * (slave_id + 1) / slaves) - start;
-			MPI_Info(&resultsInfo, size, MPI_INT, slave_id, slave_id, MPI_COMM_WORLD, &status);
+			MPI_Recv(&resultsInfo, size, MPI_INT, slave_id, slave_id, MPI_COMM_WORLD, &status);
 			for (i = 0; i < size; i++) {
 				if (resultsInfo[i]) {
 					result = 1;
@@ -567,7 +569,7 @@ void findAllLegalMove(char *board, int player, int *moves, int *moveCounts) {
 		//receive results back from slaves
 		int resultInfo;
 		for (i = 0; i < boardSize; i++) {
-			MPI_Info(&resultInfo, 1, MPI_INT, i, i, MPI_COMM_WORLD, &status);
+			MPI_Recv(&resultInfo, 1, MPI_INT, i, i, MPI_COMM_WORLD, &status);
 			if (resultInfo) {
 				result = 1;
 				moves[count] = i;
@@ -626,8 +628,8 @@ double heuristicEval(int player, char* board) {
 }
 /*START OF MINI MAX ALGORITHM*/
 double getMinMax(int player, char *board, int depth, int minOrMax, double alpha, double beta) {
-
-	if (depth > maxDepth || boardVisited >= maxBoards) {
+	current = clock();
+	if (depth > maxDepth || boardVisited >= maxBoards || (double)(current - start) / CLOCKS_PER_SEC >(double)(timeOut)) {
 		searchedEntire = 0;
 		return heuristicEval(player, board);
 	}
@@ -710,7 +712,7 @@ void getMinimaxMoves(char *board, int *bestMoves, int *moveCount) {
 	double alpha = DBL_MIN;
 	double beta = DBL_MAX;
 
-	searchedEntire = 1; boardVisited = 1; deepestDepthVisited = 0; startTime = wall_clock_time();
+	searchedEntire = 1; boardVisited = 1; deepestDepthVisited = 0; start = clock();
 	//get all moves
 	int legalMoves[676];
 	double scoreLegalMove[676];
@@ -756,7 +758,7 @@ void getMinimaxMoves(char *board, int *bestMoves, int *moveCount) {
 
 
 int main(int argc, char **argv) {
-	
+
 	int nprocs;
 	MPI_Init(&argc, &argv);
 	MPI_Comm_size(MPI_COMM_WORLD, &nprocs);

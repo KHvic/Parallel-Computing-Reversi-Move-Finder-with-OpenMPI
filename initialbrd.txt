@@ -1,5 +1,5 @@
-Size: 5,5
-White: {d4,c3}
-Black: {d3,c4}
+Size: 8,8
+White: {e5,d4,d3,d7}
+Black: {e4,d5,d8}
 Color: Black
-Timeout: 99999
+Timeout: 30
