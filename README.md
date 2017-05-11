@@ -2,5 +2,5 @@
 
 Implemented:
 Alpha Beta pruning
-Master-Slave model
-OpenMPI parallelism on legal moves
+,Master-Slave model
+,OpenMPI parallelism on legal moves
